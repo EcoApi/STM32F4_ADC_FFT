@@ -7,29 +7,45 @@
 #include "arm_const_structs.h"
 #include "arm_common_tables.h"
 
-#define DEBUG_SAMPLING_FREQUENCY 1
-#define FFT_USE_WINDOWING 1
-#define FFT_USE_FILTER_HIGH 1
-#define FFT_USE_FILTER_LOW 1
+#define DEBUG_SAMPLING_FREQUENCY      1
+#define FFT_USE_WINDOWING             1
+#define FFT_USE_FILTER_HIGH           0
+#define FFT_USE_FILTER_LOW            0
+#define FTT_USE_FREQ_FACTOR           1
+#define FFT_LOG_ENABLED               1
 
-#define SAMPLING_FREQUENCY (4000) //44000) /* Hz */
+#define FFT_SAMPLE_FREQ_HZ            (4000) /* only : 2000 / 4000 / 8000 / 16000 Hz */
+#define FFT_OUTPUT_SIZE               1024UL
+#define FTT_COUNT                     2 
+#define FFT_ADC_SAMPLING_SIZE         (FFT_OUTPUT_SIZE * 2)
+#define FFT_ADC_BUFFER_SIZE           (FFT_OUTPUT_SIZE * (FTT_COUNT + (FTT_COUNT % 2)))
+#define FFT_COMPLEX_INPUT             (FFT_OUTPUT_SIZE * 2UL)
 
-#define SAMPLE_SIZE 1024UL
-#define FULLBUFFERSIZE (SAMPLE_SIZE*2)
-
-#define AUDIO_APP_LOG_ENABLED               1
-#define FFT_LOG_ENABLED                     1
-#define GRAPH_WINDOW_HEIGHT                 40                              //!< Graph window height used in draw function.
-#define BLOCKS_TO_TRANSFER                  1 //2
-#define FFT_COMPLEX_INPUT                   (SAMPLE_SIZE * 2UL)
-#define FFT_OUTPUT_SIZE                     SAMPLE_SIZE //(I2S_DATA_BLOCK_WORDS / 2UL)
-
-#define FFT_TEST_SAMPLE_FREQ_HZ             SAMPLING_FREQUENCY //(MCLK_FREQ_HZ/128.0f) 
-#define FFT_TEST_SAMPLE_FREQ_FACTOR         (3.7878) /* for 4kHz sampling frequency */   // todo create calibration mecanisme get n point and compute factor           
-#define FFT_TEST_SAMPLE_RES_HZ              ((FFT_TEST_SAMPLE_FREQ_HZ / FFT_COMPLEX_INPUT) * FFT_TEST_SAMPLE_FREQ_FACTOR)
-
-#define FFT_TEST_HIGH_CUTT_OFF_FREQ         50 /* Hz */
-#define FFT_TEST_LOW_CUTT_OFF_FREQ          50 /* Hz */
+#if (FTT_USE_FREQ_FACTOR == 1)
+  #if (FFT_SAMPLE_FREQ_HZ == 2000)
+    #define FFT_SAMPLE_FREQ_FACTOR      (1.9526) /* For sampling 2000Hz, res 1.91Hz */
+  #elif (FFT_SAMPLE_FREQ_HZ == 4000)
+    #define FFT_SAMPLE_FREQ_FACTOR      (1.94) /* For sampling 4000Hz, res 3.79Hz */
+  #elif  (FFT_SAMPLE_FREQ_HZ == 8000)
+    #define FFT_SAMPLE_FREQ_FACTOR      (1.9466) /* For sampling 8000Hz, res 7.6Hz */
+  #elif  (FFT_SAMPLE_FREQ_HZ == 16000)
+    #define FFT_SAMPLE_FREQ_FACTOR      (1.9451) /* For sampling 16000Hz, res 15.20Hz */      
+  #else
+    //try sample 4100Hz for beep with ratio 1.95
+    #define FFT_SAMPLE_FREQ_FACTOR      (1.950) /* For sampling 16000Hz */      
+  #endif
+#else
+  /*
+    Apply in input 100Hz, 200Hz, 500Hz, 1000Hz, 1500Hz, 2000Hz, etc ....
+    And read the frequency in trace (for exemple 54.69HZ): Max value: 15.6448 at [7] = 54.69 Hz" 
+    And divide each target frequency by each measure : ex 1000 / 54.69 HZ = Ratio for 1000 Hz target
+    Finish by compute average of each ratio (FFT_SAMPLE_FREQ_FACTOR = average of each ratio)
+  */
+  #define FFT_SAMPLE_FREQ_FACTOR      (1.0)
+#endif  
+#define FFT_SAMPLE_RES_HZ             ((float32_t)(((float32_t)FFT_SAMPLE_FREQ_HZ / (float32_t)FFT_COMPLEX_INPUT) * (float32_t)FFT_SAMPLE_FREQ_FACTOR))
+#define FFT_HIGH_CUTT_OFF_FREQ        50 /* Hz */
+#define FFT_LOW_CUTT_OFF_FREQ         50 /* Hz */
 
 ADC_HandleTypeDef hadc1;
 DMA_HandleTypeDef hdma_adc1;
@@ -37,29 +53,21 @@ DMA_HandleTypeDef hdma_dac1;
 TIM_HandleTypeDef htim2;
 UART_HandleTypeDef huart1;
 
-uint32_t adcData[FULLBUFFERSIZE];
+uint32_t adcData[FFT_ADC_BUFFER_SIZE];
 
-static volatile uint32_t* inbufPtr = NULL;
-static volatile uint32_t* outbufPtr;
+static uint8_t adcDataCount = 0;
+static uint8_t fftPerformed = 0;
+static bool fftStarted = FALSE;
+
+FFT_RESULTS fftResult[FTT_COUNT];
 
 char sz_traceBuffer[10000];
 size_t sz_traceBufferSize;
 
 const static arm_cfft_instance_f32 *S;
 
-uint16_t blocksOffset = BLOCKS_TO_TRANSFER;
-uint16_t volatile blocksTransferred;
-bool loop = FALSE;
-
-static volatile bool fftIsBusy = FALSE;
-
 static float m_fft_output_f32[FFT_OUTPUT_SIZE];             //!< FFT output data. Frequency domain.
 static float m_fft_input_f32[FFT_COMPLEX_INPUT] = {0};     //!< FFT input array for complex numbers. Time domain.
-static uint32_t     fftSamples[SAMPLE_SIZE] = {0};
-
-BEEP_protocol_s     fft_result;
-BEEP_protocol_s     settings;
-
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
@@ -114,80 +122,6 @@ void trace(const char * format, ... ) {
 }
 
 #if (FFT_USE_WINDOWING == 1)
-#if 0
-/* Windowing type */
-#define FFT_WIN_TYP_RECTANGLE 0x00 /* rectangle (Box car) */
-#define FFT_WIN_TYP_HAMMING 0x01 /* hamming */
-#define FFT_WIN_TYP_HANN 0x02 /* hann */
-#define FFT_WIN_TYP_TRIANGLE 0x03 /* triangle (Bartlett) */
-#define FFT_WIN_TYP_NUTTALL 0x04 /* nuttall */
-#define FFT_WIN_TYP_BLACKMAN 0x05 /* blackman */
-#define FFT_WIN_TYP_BLACKMAN_NUTTALL 0x06 /* blackman nuttall */
-#define FFT_WIN_TYP_BLACKMAN_HARRIS 0x07 /* blackman harris*/
-#define FFT_WIN_TYP_FLT_TOP 0x08 /* flat top */
-#define FFT_WIN_TYP_WELCH 0x09 /* welch */
-
-#define twoPi 6.28318531
-#define fourPi 12.56637061
-#define sixPi 18.84955593
-#define sq(x) ((x)*(x))
-
-#define FFT_FORWARD 0x01
-#define FFT_REVERSE 0x00
-
-void Windowing(double *vData, uint16_t samples, uint8_t windowType, uint8_t dir)
-{// Weighing factors are computed once before multiple use of FFT
-// The weighing function is symetric; half the weighs are recorded
-
-	double samplesMinusOne = (double) samples - 1.0;
-	for (uint16_t i = 0; i < (samples >> 1); i++) {
-		double indexMinusOne = (double) i;
-		double ratio = (indexMinusOne / samplesMinusOne);
-		double weighingFactor = 1.0;
-		// Compute and record weighting factor
-		switch (windowType) {
-		case FFT_WIN_TYP_RECTANGLE: // rectangle (box car)
-			weighingFactor = 1.0;
-			break;
-		case FFT_WIN_TYP_HAMMING: // hamming
-			weighingFactor = 0.54 - (0.46 * cos(twoPi * ratio));
-			break;
-		case FFT_WIN_TYP_HANN: // hann
-			weighingFactor = 0.54 * (1.0 - cos(twoPi * ratio));
-			break;
-		case FFT_WIN_TYP_TRIANGLE: // triangle (Bartlett)
-			weighingFactor = 1.0 - ((2.0 * abs(indexMinusOne - (samplesMinusOne / 2.0))) / samplesMinusOne);
-			break;
-		case FFT_WIN_TYP_NUTTALL: // nuttall
-			weighingFactor = 0.355768 - (0.487396 * (cos(twoPi * ratio))) + (0.144232 * (cos(fourPi * ratio))) - (0.012604 * (cos(sixPi * ratio)));
-			break;
-		case FFT_WIN_TYP_BLACKMAN: // blackman
-			weighingFactor = 0.42323 - (0.49755 * (cos(twoPi * ratio))) + (0.07922 * (cos(fourPi * ratio)));
-			break;
-		case FFT_WIN_TYP_BLACKMAN_NUTTALL: // blackman nuttall
-			weighingFactor = 0.3635819 - (0.4891775 * (cos(twoPi * ratio))) + (0.1365995 * (cos(fourPi * ratio))) - (0.0106411 * (cos(sixPi * ratio)));
-			break;
-		case FFT_WIN_TYP_BLACKMAN_HARRIS: // blackman harris
-			weighingFactor = 0.35875 - (0.48829 * (cos(twoPi * ratio))) + (0.14128 * (cos(fourPi * ratio))) - (0.01168 * (cos(sixPi * ratio)));
-			break;
-		case FFT_WIN_TYP_FLT_TOP: // flat top
-			weighingFactor = 0.2810639 - (0.5208972 * cos(twoPi * ratio)) + (0.1980399 * cos(fourPi * ratio));
-			break;
-		case FFT_WIN_TYP_WELCH: // welch
-			weighingFactor = 1.0 - sq((indexMinusOne - samplesMinusOne / 2.0) / (samplesMinusOne / 2.0));
-			break;
-		}
-		if (dir == FFT_FORWARD) {
-			vData[i] *= weighingFactor;
-			vData[samples - (i + 1)] *= weighingFactor;
-		}
-		else {
-			vData[i] /= weighingFactor;
-			vData[samples - (i + 1)] /= weighingFactor;
-		}
-	}
-}
-#else
 //https://github.com/sidneycadot/WindowFunctions
 //https://github.com/kichiki/WaoN/blob/master/fft.c
 //https://github.com/kfrlib/kfr
@@ -296,33 +230,24 @@ windowing (int n, const double *data, int flag_window, double scale, double *out
 }
 
 #endif
-#endif
 
-void HAL_ADC_ConvHalfCpltCallback(ADC_HandleTypeDef* hadc)
-{
-  inbufPtr = &adcData[0];
-
-  // Check if the FFT is ready to accept new data
-  //if(!fftIsBusy)
-  //{
-  //  memcpy(fftSamples, &adcData[0], SAMPLE_SIZE);
-  //  fftIsBusy = TRUE;
-  //}
+void HAL_ADC_ConvHalfCpltCallback(ADC_HandleTypeDef* hadc) {
+  if(++adcDataCount >= FTT_COUNT)
+    HAL_ADC_Stop_DMA(&hadc1);
+  
+  if(!fftStarted)
+    fftStarted = TRUE;
 
   HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_8);
 }
 
-void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
-{
-	inbufPtr = &adcData[SAMPLE_SIZE];
-
-  // Check if the FFT is ready to accept new data
-  if(!fftIsBusy)
-  {
-    memcpy(fftSamples, &adcData[SAMPLE_SIZE], SAMPLE_SIZE);
-    fftIsBusy = TRUE;
-  }
-
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc) {
+  if(++adcDataCount < FTT_COUNT) 
+    HAL_ADC_Start_DMA(&hadc1, (uint32_t*) &adcData[/*pwr of 2*/adcDataCount*FFT_OUTPUT_SIZE], FFT_ADC_BUFFER_SIZE);
+  
+  if(!fftStarted) 
+    fftStarted = TRUE;
+  
   HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_8);
 }
 
@@ -334,48 +259,45 @@ void HAL_TIM_OC_DelayElapsedCallback(TIM_HandleTypeDef* htim)
 #endif
 
 bool processDSP(void) {
-  // Check whether a block has been released by the I2S peripheral.
-  if(fftIsBusy) {
-    blocksTransferred++;
+  uint16_t adcIndex = fftPerformed*FFT_OUTPUT_SIZE;
 
-    // Only process the I2S data of the I2S measurement result we'll actually use. When loop==true each sample is processed.
-    if((blocksTransferred < blocksOffset) && (blocksOffset != 0) && !loop) {
-      fftIsBusy = FALSE;
-      return;
-    }
+  if(!fftStarted)
+    return FALSE;
+  
+  if(fftPerformed > FTT_COUNT)
+    return FALSE;
 
-#if 1
-    //print_plotter(fftSamples, SAMPLE_SIZE);
-#endif
+  TRACE("New fft %d:\r\n", fftPerformed);  
 
 #if (FFT_USE_WINDOWING == 1)   
-    double f64_fftSamples[SAMPLE_SIZE];
-    float32_t f32_fftSamples[SAMPLE_SIZE];
+    //double f64_fftSamples[FFT_OUTPUT_SIZE];
+    float32_t f32_fftSamples[FFT_OUTPUT_SIZE];
     uint32_t i;
 
-    for (i=0;i<SAMPLE_SIZE;i++) {
-      //f64_fftSamples[i] = (double) (__LL_ADC_CALC_DATA_TO_VOLTAGE(3300, fftSamples[i], LL_ADC_RESOLUTION_12B) / 1000.0) - 1.25;
-      f64_fftSamples[i] = (double) (__LL_ADC_CALC_DATA_TO_VOLTAGE(3300, fftSamples[i], LL_ADC_RESOLUTION_12B) / 1000.0);
-      //p_input[i] = (float32_t) __LL_ADC_CALC_DATA_TO_VOLTAGE(3300, samples[i], LL_ADC_RESOLUTION_12B);
-      //p_input[i] = (float32_t) samples[i];
+#if 0
+    /* Trace input sample for current fft */
+    TRACE("ADC samples:\r\n");
+    for(i=adcIndex;i<adcIndex + FFT_OUTPUT_SIZE;i++) {
+     TRACE("[ %d | %u ] , ", i, adcData[i]);
     }
-
-#if 0
-#if 0
-    #define FFT_WIN_TYP_RECTANGLE 0x00 /* rectangle (Box car) */
-    #define FFT_WIN_TYP_HAMMING 0x01 /* hamming */
-    #define FFT_WIN_TYP_HANN 0x02 /* hann */
-    #define FFT_WIN_TYP_TRIANGLE 0x03 /* triangle (Bartlett) */
-    #define FFT_WIN_TYP_NUTTALL 0x04 /* nuttall */
-    #define FFT_WIN_TYP_BLACKMAN 0x05 /* blackman */
-    #define FFT_WIN_TYP_BLACKMAN_NUTTALL 0x06 /* blackman nuttall */
-    #define FFT_WIN_TYP_BLACKMAN_HARRIS 0x07 /* blackman harris*/
-    #define FFT_WIN_TYP_FLT_TOP 0x08 /* flat top */
-    #define FFT_WIN_TYP_WELCH 0x09 /* welch */
+    TRACE("\r\n");
 #endif
-    Windowing(f64_fftSamples, SAMPLE_SIZE, FFT_WIN_TYP_HANN, FFT_FORWARD);
 
-#else
+  float32_t dcComponent = 0.0;
+
+  for(i=adcIndex;i<adcIndex + FFT_OUTPUT_SIZE;i++) {
+      f32_fftSamples[i - adcIndex] = (float32_t) (__LL_ADC_CALC_DATA_TO_VOLTAGE(3300, adcData[i], LL_ADC_RESOLUTION_12B) / 1000.0);
+
+      dcComponent += f32_fftSamples[i - adcIndex];
+  }
+
+  dcComponent = dcComponent / (float32_t) FFT_OUTPUT_SIZE;
+
+  TRACE("FFT DC component %f :\r\n", dcComponent);
+
+  for(i=0;i<FFT_OUTPUT_SIZE;i++)
+      f32_fftSamples[i] -= dcComponent;
+
 /*  flag_window : 0 : no-window (default -- that is, other than 1 ~ 6)
  *                1 : parzen window
  *                2 : welch window
@@ -384,23 +306,19 @@ bool processDSP(void) {
  *                5 : blackman window
  *                6 : steeper 30-dB/octave rolloff window
  */
-    windowing (SAMPLE_SIZE, f64_fftSamples, 4 /* hamming */, 1.0, f64_fftSamples);
-#endif
-
-    for (i=0;i<SAMPLE_SIZE;i++)
-      f32_fftSamples[i] = (float32_t) f64_fftSamples[i];
+    //windowing (FFT_OUTPUT_SIZE, f64_fftSamples, 4 /* hamming */, 1.0, f64_fftSamples);
 
     /* Convert the uint32_t array containing the samples of the Audio ADC to an float array with complex numbers. The real part will be placed on the even 
      * indexes and the imaginary part will be set to 0 on all uneven indexes. This means that the complex input array is twice the size of the number of
      * samples.
      */
-    fft_generate_complexNumbersArray(m_fft_input_f32, FFT_COMPLEX_INPUT, f32_fftSamples, SAMPLE_SIZE);
+    fft_generate_complexNumbersArray(m_fft_input_f32, FFT_COMPLEX_INPUT, f32_fftSamples, FFT_OUTPUT_SIZE);
 #else 
     /* Convert the uint32_t array containing the samples of the Audio ADC to an float array with complex numbers. The real part will be placed on the even 
      * indexes and the imaginary part will be set to 0 on all uneven indexes. This means that the complex input array is twice the size of the number of
      * samples.
      */
-    fft_generate_complexNumbersArray(m_fft_input_f32, FFT_COMPLEX_INPUT, fftSamples, SAMPLE_SIZE);
+    fft_generate_complexNumbersArray(m_fft_input_f32, FFT_COMPLEX_INPUT, fftSamples, FFT_OUTPUT_SIZE);
 #endif
     
     //print_plotter(m_fft_input_f32, FFT_COMPLEX_INPUT);
@@ -408,7 +326,7 @@ bool processDSP(void) {
     /* Use CFFT module to process the data.
      * Ensure that the used module is equal to the number of complex number of samples.
      */
-  switch (SAMPLE_SIZE) {
+  switch (FFT_OUTPUT_SIZE) {
     case 16:
       S = &arm_cfft_sR_f32_len16;
       break;
@@ -440,15 +358,12 @@ bool processDSP(void) {
   
   arm_cfft_f32(S, m_fft_input_f32, 0, 1);
 
-  double Fmax = SAMPLING_FREQUENCY; //maximum frequency
-  double df = Fmax / FFT_COMPLEX_INPUT; //delta frequency
-
 #if (FFT_USE_FILTER_HIGH == 1)
   //high-pass filter
-  double FcutHigh = FFT_TEST_HIGH_CUTT_OFF_FREQ / df; //set cutoff frequency as FFT_TEST_HIGH_CUTT_OFF_FREQ Hz
+  float32_t FcutHigh = FFT_HIGH_CUTT_OFF_FREQ / FFT_SAMPLE_RES_HZ; 
   
-  for(uint32_t i = 0; i< FFT_COMPLEX_INPUT; i+=2) { //set frequencies <FFT_TEST_HIGH_CUTT_OFF_FREQ Hz to zero
-    if ((i<FcutHigh*2)||(i>(FFT_COMPLEX_INPUT-FcutHigh*2))) {
+  for(uint32_t i=0;i<FFT_COMPLEX_INPUT;i+=2) { //set frequencies <FFT_HIGH_CUTT_OFF_FREQ Hz to zero
+    if(((float32_t)i < (FcutHigh * 2)) || ((float32_t)i > ((float32_t) FFT_COMPLEX_INPUT - (FcutHigh * 2)))) {
       m_fft_input_f32[i] = 0; // Real part.
       m_fft_input_f32[i+1] = 0; // Img part.
     }
@@ -457,10 +372,10 @@ bool processDSP(void) {
 
 #if (FFT_USE_FILTER_LOW == 1)
   //low-pass filter
-  double FcutLow = FFT_TEST_LOW_CUTT_OFF_FREQ / df; //set cutoff frequency as FFT_TEST_HIGH_CUTT_OFF_FREQ Hz
+  float32_t FcutLow = FFT_LOW_CUTT_OFF_FREQ / FFT_SAMPLE_RES_HZ;
 
-  for(uint32_t i = 0; i< FFT_COMPLEX_INPUT; i+=2) { //set frequencies >FFT_TEST_HIGH_CUTT_OFF_FREQ Hz to zero
-    if (((i>FcutLow*2)&&(i<FFT_OUTPUT_SIZE))||((i>FFT_OUTPUT_SIZE) &&(i<(FFT_COMPLEX_INPUT-FcutLow*2)))) {
+  for(uint32_t i = 0; i< FFT_COMPLEX_INPUT; i+=2) { //set frequencies >FFT_HIGH_CUTT_OFF_FREQ Hz to zero
+    if ((((float32_t)i > (FcutLow*2)) && (i < FFT_OUTPUT_SIZE)) || ((i > FFT_OUTPUT_SIZE) &&((float32_t)i < ((float32_t)FFT_COMPLEX_INPUT - (FcutLow * 2))))) {
       m_fft_input_f32[i] = 0; // Real part.
       m_fft_input_f32[i+1] = 0; // Img part.
     }
@@ -470,34 +385,34 @@ bool processDSP(void) {
   // Calculate the magnitude at each bin using Complex Magnitude Module function.
   arm_cmplx_mag_f32(m_fft_input_f32, m_fft_output_f32, FFT_OUTPUT_SIZE);
 
-  //m_fft_output_f32[0] = 0.0; // Remove the DC offset
+  m_fft_output_f32[0] = 0.0; // Remove first bin correspond to the DC component
 
 #if FFT_LOG_ENABLED
     //print_plotter(m_fft_output_f32, FFT_OUTPUT_SIZE); // full 
-    print_plotter(m_fft_output_f32, FFT_OUTPUT_SIZE / 2); // N/2 (nyquist-theorm)
+    //print_plotter(m_fft_output_f32, FFT_OUTPUT_SIZE / 2); // N/2 (nyquist-theorm)
+
+    print_fft_max(m_fft_output_f32, FFT_OUTPUT_SIZE / 2); // N/2 (nyquist-theorm)
 #endif
 
     // Compress the data to the beep format for storage and transmission.
+#if 1
+    fft_create_result(&fftResult[fftPerformed],
+                      m_fft_output_f32, 
+                      20 /*settings.param.audio_config.fft_count*/,
+                      0 /*settings.param.audio_config.fft_start * 2*/,
+                      13 /*settings.param.audio_config.fft_stop  * 2*/,
+                      FFT_OUTPUT_SIZE / 2);
+#else
     fft_create_result(&fft_result,
                       m_fft_output_f32, 
                       settings.param.audio_config.fft_count,
                       settings.param.audio_config.fft_start * 2,
                       settings.param.audio_config.fft_stop  * 2,
                       FFT_OUTPUT_SIZE / 2);
-
-    /*if(audio.callback != NULL) {
-      fft_result.param.meas_result.source = audio.source;
-      audio.callback(&fft_result.param.meas_result);
-    }*/
-
-#if FFT_LOG_ENABLED
-    //TRACE("Received block: %u\r\n", blocksTransferred);
 #endif
-    fftIsBusy = FALSE;
-  }
 
   // Sample the TLV with the I2S interface until enough samples have been taken or sample for as long as the loop boolean is set.
-  if(blocksTransferred >= blocksOffset && !loop) {
+  //if(blocksTransferred >= blocksOffset && !loop) {
     //I2S_stop();
     //I2C_uninit();
     //audioFFT_deinit();
@@ -507,8 +422,11 @@ bool processDSP(void) {
     //todo stop audio sampling
     //uinit adc / dma / timer / gpio / ...
 
-    //return TRUE;
-  }
+  //  return FALSE;
+  //}
+
+  if(++fftPerformed >= adcDataCount)
+    fftStarted = FALSE;
 
   return FALSE;
 }
@@ -517,6 +435,19 @@ void print_plotter(float const * p_data, uint16_t size) {
   uint16_t i;
   for (i = 0; i<size; i++)
     TRACE(TRACE_FLOAT_MARKER"\r\n", TRACE_FLOAT(p_data[i]));
+}
+
+void print_fft_max(float * m_fft_output_f32, uint16_t data_size) {
+  float32_t max_value = 0;
+  uint32_t  max_val_index = 0;
+  
+  // Search FFT max value in input array with an offset of 10 to ignore the DC part.
+  uint32_t offset = 0;//10;
+  arm_max_f32(&m_fft_output_f32[offset], data_size-offset, &max_value, &max_val_index);
+  max_val_index += offset;
+  
+  TRACE("fSample: %u Hz, res:%0.2f Hz\r\n", (uint32_t) FFT_SAMPLE_FREQ_HZ, (float32_t) FFT_SAMPLE_RES_HZ);
+  TRACE("Max value: "TRACE_FLOAT_MARKER" at [%u] = %0.2f Hz\r\n\r\n", TRACE_FLOAT(max_value), max_val_index, (float32_t) max_val_index * FFT_SAMPLE_RES_HZ);
 }
 
 void print_data(uint32_t const * p_block, uint16_t size) {
@@ -548,7 +479,7 @@ void print_data(uint32_t const * p_block, uint16_t size) {
  * @param[in] add_noise   Flag for enable or disble adding noise for generated data.
  */
 #if (FFT_USE_WINDOWING == 1)
-void fft_generate_complexNumbersArray(float  *p_input, uint16_t p_inputSize, float *samples, uint16_t samplesSize) {
+void fft_generate_complexNumbersArray(float32_t  *p_input, uint16_t p_inputSize, float32_t *samples, uint16_t samplesSize) {
   uint32_t i, y;
 
   for (i=0;i<p_inputSize;i+=2) {
@@ -562,23 +493,97 @@ void fft_generate_complexNumbersArray(float  *p_input, uint16_t p_inputSize, flo
   }
 }
 #else
-void fft_generate_complexNumbersArray(float  *p_input, uint16_t p_inputSize, uint32_t *samples, uint16_t samplesSize)
+void fft_generate_complexNumbersArray(float32_t  *p_input, uint16_t p_inputSize, uint32_t *samples, uint16_t samplesSize)
 {
   uint32_t i, y;
+
+  double sum = 0;
 
   for (i=0;i<p_inputSize;i+=2) {
     y = (i) ? i / 2 : i;
 
     // Real part.
-    //p_input[complex_idx] = (float32_t) (__LL_ADC_CALC_DATA_TO_VOLTAGE(3300, samples[y], LL_ADC_RESOLUTION_12B) / 1000.0) - 1.25;
     p_input[i] = (float32_t) (__LL_ADC_CALC_DATA_TO_VOLTAGE(3300, samples[y], LL_ADC_RESOLUTION_12B) / 1000.0);
+
+    sum += p_input[i];
+
+    TRACE("FFT sum value %f, value inserted %f\r\n", sum, p_input[i]);
 
     // Img part.
     p_input[i+1] = 0;
   }
+
+  sum = sum / (double)((p_inputSize / 2));
+
+  TRACE("FFT sum value %f :\r\n", (float32_t) sum);
+
 }
 #endif
 
+#if 1
+void fft_create_result(FFT_RESULTS *p_fftResult, float *p_fftValue, uint16_t binOutputCount, uint16_t binInputOffset, uint16_t binCountInOneOutput, uint16_t fftSize) {
+  uint16_t binsOutput, binInputCurrent, i;
+  float32_t binOutputSum;
+  bool end = FALSE;
+
+  if((p_fftResult == NULL) || (p_fftValue == NULL) || !binOutputCount || (binOutputCount > FFT_MAX_BINS) || !fftSize)
+    return;
+
+  p_fftResult->start = binInputOffset; // start input bin
+  p_fftResult->stop = binCountInOneOutput; // n input bin for one output bin
+
+  //TRACE("FFT compute ouput:\r\n");
+
+  for(binsOutput=0;binsOutput<binOutputCount;binsOutput++) {
+    binOutputSum = 0.0;
+
+    //TRACE("%02d -> ", binsOutput);
+
+    for(i=0;i<binCountInOneOutput;i++) {
+      binInputCurrent = binInputOffset + ((binsOutput * binCountInOneOutput) + i);
+
+      if(binInputCurrent >= fftSize) {
+        end = TRUE;
+        break;
+      }  
+
+      binOutputSum += p_fftValue[binInputCurrent];
+      //TRACE("%03d: %0.3f   ", binInputCurrent, p_fftValue[binInputCurrent]);
+    }
+
+    //TRACE("\r\n");
+
+    p_fftResult->values[binsOutput] = (binOutputSum > UINT16_MAX) ? UINT16_MAX : (uint16_t) binOutputSum; // check diff on 32 bits !!!
+
+    if(end)
+      break;
+  }
+
+  p_fftResult->bins = binsOutput; //n output bin computed
+
+#if 1 //FFT_LOG_ENABLED
+  float32_t startFrequency = binInputOffset * FFT_SAMPLE_RES_HZ;
+  float32_t binFrequency = (float32_t) binCountInOneOutput * FFT_SAMPLE_RES_HZ;
+  uint16_t binEnd = binInputOffset + (p_fftResult->bins * binCountInOneOutput);
+
+  if(binEnd >= fftSize)
+    binEnd = fftSize;
+
+  TRACE("FFT result start: %u / %0.2f Hz, end: %u / %0.2f Hz, out bin freq: %0.2f Hz, out bin count: %u, in bin by out bin: %u\r\n", binInputOffset, startFrequency,  binEnd, (float32_t) binEnd * FFT_SAMPLE_RES_HZ, binFrequency, p_fftResult->bins, binCountInOneOutput);
+
+  for(binsOutput=0;binsOutput<p_fftResult->bins;binsOutput++) {
+    TRACE("%02d -> brut s_bin%f_%fHz,\t\ts_bin%04d_%04dHz = %u\r\n", binsOutput,
+                                               (float32_t) (startFrequency + ((float32_t) binsOutput * binFrequency)), //todo round
+                                               (float32_t) (startFrequency + ((float32_t) binsOutput * binFrequency) + binFrequency), //todo round 
+                                               (uint16_t) (startFrequency + ((float32_t) binsOutput * binFrequency)), //todo round
+                                               (uint16_t) (startFrequency + ((float32_t) binsOutput * binFrequency) + binFrequency), //todo round
+                                               p_fftResult->values[binsOutput]);
+
+
+  }
+#endif
+}
+#else
 void fft_create_result(BEEP_protocol_s * ret, float * fft, uint16_t count, uint16_t start, uint16_t stop, uint16_t fftSize) {
   uint16_t binOffset;
   uint16_t i, j, sumNbins, diff;
@@ -593,8 +598,8 @@ void fft_create_result(BEEP_protocol_s * ret, float * fft, uint16_t count, uint1
   arm_max_f32(&fft[offset], fftSize - offset, &max_value, &max_val_index);
   max_val_index += offset;
   
-  TRACE("fSample: %u Hz, res:%u Hz\r\n", (uint32_t)SAMPLING_FREQUENCY, (uint32_t) FFT_TEST_SAMPLE_RES_HZ); /* todo compute factor for frequency accuracy */
-  TRACE("Max value: "TRACE_FLOAT_MARKER" at [%u] = %u Hz\r\n\r\n", TRACE_FLOAT(max_value), max_val_index, (uint32_t)(((float) max_val_index * (float) FFT_TEST_SAMPLE_RES_HZ) /* * 3.7878  factor frequency */));
+  TRACE("fSample: %u Hz, res:%0.2f Hz\r\n", (uint32_t)FFT_SAMPLE_FREQ_HZ, (float32_t) FFT_SAMPLE_RES_HZ); /* todo compute factor for frequency accuracy */
+  TRACE("Max value: "TRACE_FLOAT_MARKER" at [%u] = %0.2f Hz\r\n\r\n", TRACE_FLOAT(max_value), max_val_index, (float32_t) max_val_index * FFT_SAMPLE_RES_HZ);
 
 //  #define DEFAULT_FFT_DIVIDER         10 //count
 //  #define DEFAULT_FFT_START           0 //start
@@ -619,77 +624,49 @@ void fft_create_result(BEEP_protocol_s * ret, float * fft, uint16_t count, uint1
    * 256 / 20 = 13.8
    * 13 * 20 = 240. 240 < 256 -> sumNbins = 14
    */
-  if((count * sumNbins) < diff) //(10 * 12) < 127 then 121 
-    {
-        sumNbins++;
-    }
-    binOffset = start; 
+  if((count * sumNbins) < diff) { //(10 * 12) < 127 then 121 
+    sumNbins++;
+  }
+  binOffset = start; 
      
-    for(i=0; i<count; i++) //0 to 10
-    {
-        binSum = 0.0;
+  for(i=0; i<count; i++) { //0 to 10
+    binSum = 0.0;
 
-        for(j=0; j<sumNbins; j++) // 0 to 121
-        {
-            if(binOffset >= stop) 
-            {
-                break;
-            }
-            binSum += fft[binOffset];
-            binOffset++;
-        }
-
-        #if 0
-            // Average bin value
-            float binAverage = binSum / (float) j;
-            result->values[i] = (binAverage > UINT16_MAX) ? UINT16_MAX : (uint16_t) binAverage;
-        #else
-            // Total sum value per bin
-            result->values[i] = (binSum > UINT16_MAX) ? UINT16_MAX : (uint16_t) binSum;
-        #endif
-        result->bins++;
+    for(j=0; j<sumNbins; j++) { // 0 to 121
+      if(binOffset >= stop) 
+        break;
+    
+      binSum += fft[binOffset];
+      binOffset++;
     }
+
+#if 0
+    // Average bin value
+    float binAverage = binSum / (float) j;
+    result->values[i] = (binAverage > UINT16_MAX) ? UINT16_MAX : (uint16_t) binAverage;
+#else
+    // Total sum value per bin
+    result->values[i] = (binSum > UINT16_MAX) ? UINT16_MAX : (uint16_t) binSum;
+ #endif
+    result->bins++;
+  }
 
 #if FFT_LOG_ENABLED
-    TRACE("FFT result start %u/%u Hz, stop: %u/%u Hz, bin count: %u, samples/bin %u ", start, start * FFT_TEST_SAMPLE_RES_HZ,  stop, stop * FFT_TEST_SAMPLE_RES_HZ, count, sumNbins);
+  TRACE("FFT result start %u/%0.2f Hz, stop: %u/%0.2f Hz, bin count: %u, samples/bin %u ", start, (float32_t) start * FFT_SAMPLE_RES_HZ,  stop, (float32_t) stop * FFT_SAMPLE_RES_HZ, count, sumNbins);
 
-    for(i=0; i<count; i++)
-    {
-        // Total sum value per bin
-        TRACE("[%u] = %u, ", i, result->values[i]);
-    }
+  for(i=0;i<count;i++) {
+    // Total sum value per bin
+    TRACE("[%u] = %u, ", i, result->values[i]);
+  }
 
-    TRACE("\r\n");
+  TRACE("\r\n");
+
+  //print_plotter(result->values, count);
 #endif
 }
+#endif
 
-/**
- * @brief Function for drawing line and processed data informations.
- * @param[in] input_sine_freq Input sine wave frequency.
- * @param[in] is_noisy        Flag if data is noisy.
- * @param[in] chart_width     Drawing chart height.
- */
-static void draw_fft_header(float32_t input_sine_freq)
-{
-    TRACE("fSample: %u Hz, res:%u Hz\r\n", (uint32_t)input_sine_freq, (uint32_t) FFT_TEST_SAMPLE_RES_HZ);
-}
-
-void draw_fft_max(float * m_fft_output_f32, uint16_t data_size)
-{
-  float32_t max_value = 0;
-  uint32_t  max_val_index = 0;
-  
-  // Search FFT max value in input array with an offset of 10 to ignore the DC part.
-  uint32_t offset = 0;//10;
-  arm_max_f32(&m_fft_output_f32[offset], data_size-offset, &max_value, &max_val_index);
-  max_val_index += offset;
-  
-  TRACE("fSample: %u Hz, res:%u Hz\r\n", (uint32_t)SAMPLING_FREQUENCY, (uint32_t) FFT_TEST_SAMPLE_RES_HZ);
-  TRACE("Max value: "TRACE_FLOAT_MARKER" at [%u] = %u Hz\r\n\r\n", TRACE_FLOAT(max_value), max_val_index, (max_val_index * FFT_TEST_SAMPLE_RES_HZ));
-}
-
-int main(void)
-{
+int main(void) {
   HAL_Init();
 
   SystemClock_Config(); /* 16 mHz */
@@ -709,19 +686,7 @@ int main(void)
   HAL_TIM_OC_Start(&htim2, TIM_CHANNEL_1); //debug timer
 #endif
 
-	HAL_ADC_Start_DMA(&hadc1, (uint32_t *) adcData, sizeof(adcData));
-  
-	//settings.param.audio_config.channel;
-  //settings.param.audio_config.gain;
-  //settings.param.audio_config.volume;
-  settings.param.audio_config.fft_count = DEFAULT_FFT_DIVIDER;
-  settings.param.audio_config.fft_start = DEFAULT_FFT_START;
-  settings.param.audio_config.fft_stop = DEFAULT_FFT_STOP;    
-  //settings.param.audio_config.min6dB;   
-
-  blocksTransferred = 0;
-
-  //TRACE("Start Applications\r\n");
+	HAL_ADC_Start_DMA(&hadc1, (uint32_t *) adcData, FFT_ADC_BUFFER_SIZE);
 
   while (TRUE) {
 		if(processDSP() == TRUE)
@@ -779,7 +744,7 @@ static void MX_ADC1_Init(void)
   hadc1.Init.ExternalTrigConv = ADC_EXTERNALTRIGCONV_T2_TRGO;
   hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
   hadc1.Init.NbrOfConversion = 1;
-  hadc1.Init.DMAContinuousRequests = ENABLE;
+  hadc1.Init.DMAContinuousRequests = DISABLE; //ENABLE; /* circular or not */
   hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
   if (HAL_ADC_Init(&hadc1) != HAL_OK)
   {
@@ -804,7 +769,7 @@ static void MX_TIM2_Init(void)
   htim2.Instance = TIM2;
   htim2.Init.Prescaler = 0;
   htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim2.Init.Period = (HAL_RCC_GetHCLKFreq() / SAMPLING_FREQUENCY) - 1;
+  htim2.Init.Period = (HAL_RCC_GetHCLKFreq() / FFT_SAMPLE_FREQ_HZ) - 1;
   htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
   if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
